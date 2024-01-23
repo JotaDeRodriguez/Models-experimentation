@@ -1,0 +1,152 @@
+"""
+Source: https://medium.com/@amir_shakiba/grounded-dino-meta-ais-sam-instance-segmentation-386240de4825
+
+This is a really interesting implementation of Dino and SAM to create zeroshot segmentation from prompting. Experimenting ways to create a training pipeline
+
+"""
+
+
+import torch
+import cv2
+import os
+import sys
+
+HOME = os.getcwd()
+%cd {HOME}
+#downloading Grounding DINO model
+!git clone https://github.com/IDEA-Research/GroundingDINO.git
+%cd {HOME}/GroundingDINO
+!git checkout -q 57535c5a79791cb76e36fdb64975271354f10251
+!pip install -q -e .
+#downloading the SAM model
+!{sys.executable} -m pip install 'git+https://github.com/facebookresearch/segment-anything.git'
+!mkdir -p {HOME}/weights
+%cd {HOME}/weights
+#downloading pretrained Grounding dino weights
+!wget -q https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth
+!mkdir -p {HOME}/weights
+%cd {HOME}/weights
+#downloading pretrained SAM weights
+
+!wget -q https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth
+%cd {HOME}
+#checking if all the necessary files exist
+GROUNDING_DINO_CHECKPOINT_PATH = os.path.join(HOME, "weights", "groundingdino_swint_ogc.pth")
+print(GROUNDING_DINO_CHECKPOINT_PATH, "; exist:", os.path.isfile(GROUNDING_DINO_CHECKPOINT_PATH))
+GROUNDING_DINO_CONFIG_PATH = os.path.join(HOME, "GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py")
+print(GROUNDING_DINO_CONFIG_PATH, "; exist:", os.path.isfile(GROUNDING_DINO_CONFIG_PATH))
+SAM_CHECKPOINT_PATH = os.path.join(HOME, "weights", "sam_vit_h_4b8939.pth")
+print(SAM_CHECKPOINT_PATH, "; exist:", os.path.isfile(SAM_CHECKPOINT_PATH))
+
+!pip uninstall -y supervision
+!pip install -q supervision==0.6.0
+
+import supervision as sv
+print(sv.__version__)
+
+%cd {HOME}/GroundingDINO
+
+from groundingdino.util.inference import Model
+
+grounding_dino_model = Model(model_config_path=GROUNDING_DINO_CONFIG_PATH, model_checkpoint_path=GROUNDING_DINO_CHECKPOINT_PATH)
+
+SAM_ENCODER_VERSION = "vit_h"
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+from segment_anything import sam_model_registry, SamPredictor
+
+sam = sam_model_registry[SAM_ENCODER_VERSION](checkpoint=SAM_CHECKPOINT_PATH).to(device=DEVICE)
+sam_predictor = SamPredictor(sam)
+
+%cd {HOME}
+!mkdir {HOME}/data
+%cd {HOME}/data
+
+!wget -q  -O image.jpg  https://p1.pxfuel.com/preview/846/525/316/watch-sunglasses-accessories-iphone-mobile-technology.jpg
+!wget -q  -O image2.jpg  https://p0.pxfuel.com/preview/207/351/628/background-fashion-lifestyle-traveler.jpg
+!wget -q  -O image3.jpg  https://images.unsplash.com/3/www.madebyvadim.com.jpg?ixlib=rb-4.0.3&q=85&fm=jpg&crop=entropy&cs=srgb&dl=vadim-sherbakov-tCICLJ5ktBE-unsplash.jpg&w=640
+
+SOURCE_IMAGE_PATH = "/content/IMG_1028.JPG"
+CLASSES = ['tower', 'parabola', 'shelter', 'fence']
+BOX_TRESHOLD = 0.25
+TEXT_TRESHOLD = 0.25
+def add_all_suffix(class_names):
+    result = []
+    for class_name in class_names:
+        result.append("all " + class_name + "s")
+    return result
+class_names = add_all_suffix(CLASSES)
+#class_names =['all watchs', 'all sunglassess', 'all phones', 'all headphones']
+
+# load image
+image = cv2.imread(SOURCE_IMAGE_PATH)
+
+# detect objects
+detections = grounding_dino_model.predict_with_classes(
+    image=image,
+    classes=class_names,
+    box_threshold=BOX_TRESHOLD,
+    text_threshold=TEXT_TRESHOLD
+)
+
+# annotate image with detections
+box_annotator = sv.BoxAnnotator()
+labels = [
+    f"{CLASSES[class_id]} {confidence:0.2f}"
+    for _, _, confidence, class_id, _
+    in detections]
+annotated_frame = box_annotator.annotate(scene=image.copy(), detections=detections, labels=labels)
+
+%matplotlib inline
+sv.plot_image(annotated_frame, (16, 16))
+
+import numpy as np
+from segment_anything import SamPredictor
+
+
+def segment(sam_predictor: SamPredictor, image: np.ndarray, xyxy: np.ndarray) -> np.ndarray:
+    sam_predictor.set_image(image)
+    result_masks = []
+    for box in xyxy:
+        masks, scores, logits = sam_predictor.predict(
+            box=box,
+            multimask_output=True
+        )
+        index = np.argmax(scores)
+        result_masks.append(masks[index])
+    return np.array(result_masks)
+
+# convert detections to masks
+detections.mask = segment(
+sam_predictor=sam_predictor,
+image=cv2.cvtColor(image, cv2.COLOR_BGR2RGB),
+xyxy=detections.xyxy
+)
+# annotate image with detections
+box_annotator = sv.BoxAnnotator()
+mask_annotator = sv.MaskAnnotator()
+labels = [
+f"{CLASSES[class_id]} {confidence:0.2f}"
+for _, _, confidence, class_id, _
+in detections]#if you dont update SV you will face problems here .
+annotated_image = mask_annotator.annotate(scene=image.copy(), detections=detections)
+annotated_image = box_annotator.annotate(scene=annotated_image, detections=detections, labels=labels)
+%matplotlib inline
+sv.plot_image(annotated_image, (16, 16))
+
+import math
+
+grid_size_dimension = math.ceil(math.sqrt(len(detections.mask)))
+
+titles = [
+    CLASSES[class_id]
+    for class_id
+    in detections.class_id
+]
+
+sv.plot_images_grid(
+    images=detections.mask,
+    titles=titles,
+    grid_size=(grid_size_dimension, grid_size_dimension),
+    size=(16, 16)
+)
