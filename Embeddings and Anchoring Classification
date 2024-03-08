@@ -1,0 +1,133 @@
+import os
+import numpy as np
+from PIL import Image
+from transformers import CLIPProcessor, CLIPModel
+import torch
+from scipy.spatial.distance import cosine
+from IPython.display import display
+import shutil
+from torchvision.transforms import Compose, Resize, ToTensor, Normalize
+import random
+
+# Initialize CLIP
+model_id = "openai/clip-vit-base-patch32"
+processor = CLIPProcessor.from_pretrained(model_id)
+model = CLIPModel.from_pretrained(model_id)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model.to(device)
+
+HF_HUB_DISABLE_SYMLINKS_WARNING = True
+
+# Base directory containing category folders
+categories_dir = r'Y:\Imagenes_clasificadas'
+
+from PIL import ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+def get_image_embedding(image_path):
+    image = Image.open(image_path).convert("RGB")
+    preprocess = Compose([
+        Resize((224, 224)),  # Adjusted to the expected dimension
+        ToTensor(),
+        Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    image = preprocess(image).unsqueeze(0).to(device)
+    with torch.no_grad():
+        image_embedding = model.get_image_features(image).detach().cpu().numpy()
+    return image_embedding
+
+
+# Automatically discover categories and generate average embeddings for each
+anchor_embeddings = {}
+for category in os.listdir(categories_dir):
+    category_path = os.path.join(categories_dir, category)
+    if os.path.isdir(category_path):  # Ensure it's a directory
+        images = [img for img in os.listdir(category_path) if img.lower().endswith(('.jpg', '.jpeg', '.png', '.JPG', '.JPEG'))]
+
+        # Select random images , else select all
+        selected_images = random.sample(images, min(len(images), 100))
+
+        embeddings = [get_image_embedding(os.path.join(category_path, img)) for img in selected_images]
+        average_embedding = np.mean(embeddings, axis=0) if embeddings else None
+        if average_embedding is not None:
+            anchor_embeddings[category] = average_embedding
+print(anchor_embeddings)
+
+text_descriptions = {
+'Greenfield' : 'Usually blue sky, green vegetation',
+'Rooftop' : 'Buildings, building interiors or rooftops',
+'Indoor' : 'images of switches, devices, things inside'
+}
+
+# Generate text embeddings
+text_embeddings = {}
+for category, text in text_descriptions.items():
+    with torch.no_grad():
+        text_tokens = processor(text=text, return_tensors='pt', padding=True, truncation=True).to(device)
+        text_emb = model.get_text_features(**text_tokens).detach().cpu().numpy()
+    text_embeddings[category] = text_emb
+
+
+# Initialize the model and processor
+model_id = "openai/clip-vit-base-patch32"
+processor = CLIPProcessor.from_pretrained(model_id)
+model = CLIPModel.from_pretrained(model_id)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model.to(device)
+
+
+# Define similarity threshold
+similarity_threshold = 0.2  # Example threshold, adjust based on your needs
+
+def classify_with_text_and_image_embeddings(img_emb, text_embeddings, similarity_threshold):
+    best_similarity = -1
+    best_category = None
+    for category in text_descriptions.keys():
+        img_similarity = 1 - cosine(img_emb, anchor_embeddings[category].squeeze())
+        text_similarity = 1 - cosine(img_emb, text_embeddings[category].squeeze())
+
+        # Combine similarities - here we simply average them, but you can explore weighted averages or other methods
+        combined_similarity = (img_similarity + text_similarity) / 2
+
+        if img_similarity > best_similarity:
+            best_similarity = img_similarity
+            best_category = category
+
+    if best_similarity < similarity_threshold:
+        return "Unknown"
+    else:
+        return best_category
+
+
+# Define your image directory for classification
+image_dir = r'Y:\American Tower'
+
+# List all image files in the directory
+image_files = [os.path.join(image_dir, file_name) for file_name in os.listdir(image_dir) if file_name.lower().endswith(('.png', '.jpg', '.jpeg'))]
+
+# Dictionary to store image paths and their predicted categories
+predictions = {}
+
+destination_folder = r'Y:\Imagenes_clasificadas'
+
+# Process and classify each image in the directory
+
+
+for image_path in image_files:
+    # Load the image and resize
+    image = Image.open(image_path).resize((256, 256))
+
+    # Preprocess the image
+    processed_image = processor(images=image, return_tensors='pt')['pixel_values'].to(device)
+
+    # Get image embeddings
+    with torch.no_grad():  # Disable gradient computation
+        img_emb = model.get_image_features(processed_image).detach().cpu().numpy()
+
+    predicted_category = classify_with_text_and_image_embeddings(img_emb.squeeze(), text_embeddings, similarity_threshold)
+
+    # Move the image to the destination folder directory
+
+      destination_dir = os.path.join(destination_folder, predicted_category)
+      shutil.move(image_path, os.path.join(destination_dir, os.path.basename(image_path))
+      print(f"Image: {image_path} is moved to {predicted_category}")
